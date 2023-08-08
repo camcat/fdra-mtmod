@@ -72,7 +72,7 @@ function fdra(sFn,varargin)
 
   if isempty(d)
      try
-        makemex('private');
+        ok=makemex('private');
         mexfailed=~ok;
      catch
         mexfailed=1; 
