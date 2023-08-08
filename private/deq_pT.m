@@ -16,6 +16,12 @@ function [dydt] = deq_pT(t,y,c)
   tau = c.tau0 + BEM_matvec(c,s,1); 
   gP.bes = c.bes; 
   
+  % Perturbation to tau of delta_tau(x,t).
+  if (~isempty(tau) && ~isempty(c.delta_tau_fn))
+    dtau = c.delta_tau_fn(c,gP.t_g+t,0);
+    tau = tau + dtau(:);
+  end
+
   phi_dot = EvolveDlt(c, gamma, [], gP.psi, v, gP.bes);
 
   s_eff = gP.bes;
@@ -24,6 +30,10 @@ function [dydt] = deq_pT(t,y,c)
   
   v1 = [v(:); c.v_creep];
   tau_dot = BEM_matvec(c,v1,1);
+  if (~isempty(c.delta_tau_fn))
+    dtaud = c.delta_tau_fn(c,gP.t_g+t,1);
+    tau_dot = tau_dot + dtaud(:);
+  end
   c2 = 1./(mu_psi.*s_eff + c.eta.*v);
   q = tau_dot + s_eff.*mu_gamma.*phi_dot;
   gP.dvdt = v.*c2.*q;

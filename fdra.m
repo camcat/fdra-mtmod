@@ -19,7 +19,8 @@ function fdra(sFn,varargin)
 %   maxTimeBtwnSv: approx upper bound, in seconds, between saved time steps
 %   dispText: display text? if >0, display every dispText steps.
 %   use_nthreads: number of OpenMP CPU threads
-%
+%   delta_tau_fn: Optional function handle having the signature
+%       y = delta_tau_fn(c,t,deriv).%
 % Initial values:
 %   psi_init, chi_init, p_init, T_init, optionally slip_init
 %   ts, tend
@@ -64,9 +65,22 @@ function fdra(sFn,varargin)
   %Shorthand for finding cell centers
   CC = @(x) (x(2:end)+x(1:end-1))/2;
 
-  % If the mex files are not present, build them
-%  BuildMex();
-  
+  % If the mex file is not present, try to build it
+  d=dir(['private/hsvd_mex.%s' mexext]);
+
+  path(path,'util');
+
+  if isempty(d)
+     try
+        makemex('private');
+        mexfailed=~ok;
+     catch
+        mexfailed=1; 
+     end
+  else
+     mexfailed=0;
+  end
+
   fprintf(1,'... Processing user input.\n');
     
   saveFn = sFn.saveFn;
@@ -97,14 +111,21 @@ function fdra(sFn,varargin)
   chi_init = sFn.chi_init(:);
 
   %by default load both sides and fullspace, and use plane strain conditions on a dipping fault
+  if isfield(sFn,'taudot') c.taudot = sFn.taudot; end
   if isfield(sFn,'dip') c.dip = sFn.dip; else dip=10; end
   if isfield(sFn,'fullspace') c.fullspace = sFn.fullspace; else c.fullspace = true; end
   if isfield(sFn,'antiplane') c.antiplane = sFn.antiplane; else c.antiplane = false; end
   if isfield(sFn,'use_nthreads') use_nthreads = sFn.use_nthreads; else use_nthreads=0; end
-  if isfield(sFn,'use_compressed_bem') use_compressed_bem = sFn.use_compressed_bem; 
-     else use_compressed_bem = 0; end
+  if isfield(sFn,'use_compressed_bem') use_compressed_bem = sFn.use_compressed_bem; else use_compressed_bem = 0; end
   if isfield(sFn,'load_bothsides') c.load_bothsides = sFn.load_bothsides;
      else c.load_bothsides = true; end
+  if isfield(sFn,'delta_tau_fn') c.delta_tau_fn = sFn.delta_tau_fn; end
+
+
+  if mexfailed
+     warning('Could not compile mex files for matrix compression: setting use_compressed_bem=0.');
+    use_compressed_bem = 0;
+  end
 
   % disp: Plot results during integration. dispEvery: Display every dispEvery steps.
   % saveEvery, maxTimeBtwnSv: Save every saveEvery steps or when
@@ -151,7 +172,12 @@ function fdra(sFn,varargin)
   % Initial values
   slip_init = zeros(c.Ncell,1);
   % Get tau0, the initial stress that gives psi
+
   c.tau0 = Util('Stress',ts,psi_init,chi_init,slip_init,[],c,1);
+  if exist('delta_tau_fn')
+     c.tau0 = c.tau0 - delta_tau_fn(c,ts,0)';
+  end
+
   gamma_init = chi_init - psi_init;
   gP.y_init = [slip_init(:); exp(gamma_init(:)); exp(psi_init(:))];
   y_nonneg = ones(size(gP.y_init));
@@ -163,7 +189,7 @@ function fdra(sFn,varargin)
   % Clean up memory
   if (use_compressed_bem)
     % Clear Gs from memory
-    c = srmfield(c,'Gs');
+    c = rmfield(c,'Gs');
   end
 
   o = ones(c.Ncell,1);
@@ -179,10 +205,7 @@ function fdra(sFn,varargin)
   gP.sdf.tic = tic;
   intfail = 0;
   while (true)
-%    options.InitialStep = gP.InitialStep;
     gP.t0 = 0;   
-
-%TODO set options for matlab ode23.
 
     options.OutputFcn = @(t,y,flag) deq_pT_SDF_matlab (t,y,flag,c,...
           'disp',true,'dispEvery',save_every,...
@@ -191,6 +214,7 @@ function fdra(sFn,varargin)
           'name',saveFn,varargin);
 
     ops.OutputFcn=options.OutputFcn;
+    ops.MaxStep=1e6;
     ode23(@(t,y) odeFn(t,y,c),[gP.t0 tend - gP.t_g],gP.y_init,ops);
 
     gP.t_g = gP.t_g + gP.t0;
@@ -224,34 +248,49 @@ end
 function cbem = CompressedBEM(c,use_compressed_bem,use_nthreads)
   cbem.use = use_compressed_bem;
   if (use_compressed_bem)
-    error('Error: use_compressed_bem not implemented.');
+    fprintf(1,'... Compressing GF arrays.\n');
+    bemstr = 'Compressed ';
+    err = 1e-9; % down from 1e-12 after change in hsvd.m
+    
+    cbem.h = BuildCBEM(c.Gs,err,[0 1],use_nthreads);
+%    if (c.use_Gn)
+%      cbem.h = [cbem.h BuildCBEM(c.Gn,err,[2 3],use_nthreads)];
+%    end
+    cbem.strt = [0 2]; % start-1 of the Gs/Gn h structs
+    % thread index
+    if (use_nthreads <= 1)
+      cbem.thidx = 1;
+    elseif (~c.no_pT)
+      % Should be 2 in principle. But I found that multithreaded hsvd does
+      % not interact well with multithreaded deq_solve_*.c, and the latter is
+      % much more time consuming. Hence make hsvd always singlethreaded.
+      cbem.thidx = 1;
+    else
+      % p,T are not being evolved, so we might as well multithread hsvd.
+      cbem.thidx = 2;
+    end
+    if (cbem.thidx == 1)
+      cbem.h(2).ns = [];
+      cbem.h(4).ns = [];
+    end
+  else
+    bemstr = '';
   end
-%    fprintf(1,'... Compressing GF arrays.\n');
-%    bemstr = 'Compressed ';
-%    err = 1e-9; % down from 1e-12 after change in hsvd.m
-%    cbem.h = BuildCBEM(c.Gs,err,[0 1],use_nthreads);
-%    cbem.strt = [0 2]; % start-1 of the Gs h structs
-%    % thread index
-%    if (use_nthreads <= 1)
-%      cbem.thidx = 1; 
-%    elseif (~c.no_pT)
-%      % Should be 2 in principle. But I found that multithreaded hsvd does
-%      % not interact well with multithreaded deq_solve_*.c, and the latter is
-%      % much more time consuming. Hence make hsvd always singlethreaded.
-%      cbem.thidx = 1;
-%    else
-%      % p,T are not being evolved, so we might as well multithread hsvd.
-%      cbem.thidx = 2;
-%    end
-%    if (cbem.thidx == 1)
-%      cbem.h(2).ns = [];
-%      cbem.h(4).ns = [];
-%    end
-%  else
-%    bemstr = '';
-%  end
-%  fprintf(1,'%sBEM.\n',bemstr);
+  fprintf(1,'%sBEM.\n',bemstr);
 end
+
+
+function h = BuildCBEM(A,err,ids,nthreads)
+  h = hsvd('Build',A,err);
+  nnz = hsvd('nnz', h);
+  fprintf('    compression factor: %1.2f\n', prod(size(A))/nnz);
+  h(2) = hsvd('RebuildThreaded',h(1),A,nthreads);
+  for (i = 1:2)
+    h(i).id = ids(i);
+    hsvd('InitMex',h(i),ids(i));
+  end
+end
+
 
 % ------------------------------------------------------------------------------
 % BEM matrix

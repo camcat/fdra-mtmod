@@ -147,7 +147,13 @@ end
   
 function tau = StressTransform(c,t,slip)
     s = [slip(:); c.v_creep*t];
-    tau = c.tau0 + BEM_matvec(c,s,1);
+    if (isfield(c,'delta_tau_fn') && ~isempty(c.delta_tau_fn))
+      for n=1:length(t);
+        des(:,n) = c.delta_tau_fn(c,t(n),0);
+      end
+    else des=0;
+    end
+    tau = c.tau0 + BEM_matvec(c,s,1) + des;
 end
 
 function [f f_psi f_gamma f_T] = Calc_mu(c,is,psi,gamma,T)
